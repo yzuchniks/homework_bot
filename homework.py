@@ -2,10 +2,12 @@ import logging
 import os
 import sys
 import time
+from http import HTTPStatus
 
 import requests
 from dotenv import load_dotenv
 from telebot import TeleBot  # type: ignore
+from telebot.apihelper import ApiException  # type: ignore
 
 import exceptions as ex
 
@@ -25,14 +27,24 @@ HOMEWORK_VERDICTS = {
     'rejected': 'Работа проверена: у ревьюера есть замечания.'
 }
 
+log_filename = os.path.basename(__file__) + '.log'
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+file_handler = logging.FileHandler(log_filename)
+file_handler.setLevel(logging.DEBUG)
+
 stream_handler = logging.StreamHandler(stream=sys.stdout)
 stream_handler.setLevel(logging.DEBUG)
+
 formatter = logging.Formatter(
     '%(asctime)s - %(levelname)s - %(message)s'
 )
+file_handler.setFormatter(formatter)
 stream_handler.setFormatter(formatter)
+
+logger.addHandler(file_handler)
 logger.addHandler(stream_handler)
 
 
@@ -73,36 +85,53 @@ def send_message(bot, message):
             chat_id=TELEGRAM_CHAT_ID,
             text=message
         )
-        logger.debug('Сообщение успешно отправлено в Telegram.')
+    except ApiException as api_error:
+        logger.exception(f'Ошибка API Telegram: {api_error}')
+        return False
+    except requests.RequestException as request_error:
+        logger.exception(f'Ошибка запроса к Telegram: {request_error}')
+        return False
     except Exception as error:
-        logger.error(f'Сбой при отправке сообщения в Telegram: {error}')
+        logger.exception(f'Сбой при отправке сообщения в Telegram: {error}')
+        return False
+    else:
+        logger.debug('Сообщение успешно отправлено в Telegram.')
+        return True
 
 
 def get_api_answer(timestamp):
     """Получает данные от API."""
-    request_time = {'from_date': timestamp}
+    request_params = {
+        'url': ENDPOINT,
+        'headers': HEADERS,
+        'params': {'from_date': timestamp}
+    }
     try:
-        homework_statuses = requests.get(
-            ENDPOINT, headers=HEADERS, params=request_time
-        )
-        status_response = homework_statuses.status_code
-
-        if status_response != 200:
-            log_and_raise(
-                f'Ошибка при получении данных от API: '
-                f'Статус ответа {status_response}',
-                ex.ApiRequestError
-            )
-        return homework_statuses.json()
+        response = requests.get(**request_params)
     except requests.RequestException as error:
-        log_and_raise(f'Недоступность эндпоинта: {error}', ex.ApiRequestError)
+        log_and_raise(
+            f'Недоступность эндпоинта: {error}. '
+            f'Параметры запроса: {request_params}',
+            ex.ApiRequestError
+        )
+    status_response = response.status_code
+    if status_response != HTTPStatus.OK:
+        log_and_raise(
+            f'Ошибка при получении данных от API: '
+            f'Статус ответа {status_response}. '
+            f'Параметры запроса: {request_params}',
+            ex.ApiRequestError
+        )
+    return response.json()
 
 
 def check_response(response):
     """Проверяет ответ API."""
     if not isinstance(response, dict):
+        type_response = type(response)
         log_and_raise(
-            'Структура ответа API не является словарем.',
+            f'Структура ответа API не соответсвует ожидаемой. '
+            f'Полученный тип данных: {type_response}.',
             TypeError
         )
 
@@ -117,8 +146,10 @@ def check_response(response):
             KeyError
         )
     if not isinstance(response['homeworks'], list):
+        type_homeworks = type(response['homeworks'])
         log_and_raise(
-            'Данные под ключом "homeworks" не являются списком.',
+            f'Тип данных под ключом "homeworks" не соответсвует ожидаемому. '
+            f'Полученный тип данных: {type_homeworks}.',
             TypeError
         )
 
@@ -149,25 +180,34 @@ def main():
     check_tokens()
     bot = TeleBot(token=TELEGRAM_TOKEN)
     timestamp = int(time.time())
-    # timestamp = 1725032359
+    error_reported = False
 
     while True:
         try:
             response = get_api_answer(timestamp)
             check_response(response)
             homeworks = response['homeworks']
-
             if homeworks:
                 message = parse_status(homeworks[0])
-                send_message(bot, message)
+                success = send_message(bot, message)
+                if not success:
+                    logger.warning(
+                        'Не удалось отправить сообщение в Telegram.'
+                        'Повторная попытка через 60 секунд.'
+                    )
+                    time.sleep(60)
+                    continue
             else:
                 logger.debug('Отсутствие в ответе новых статусов.')
 
             timestamp = int(time.time()) - TIME_GAP
-
+            error_reported = False
         except Exception as error:
-            message = f'Сбой в работе программы: {error}'
-            send_message(bot, message)
+            logger.exception(f'Сбой в работе программы: {error}')
+            if not error_reported:
+                error_message = f'Ошибка в работе программы: {error}'
+                send_message(bot, error_message)
+                error_reported = True
 
         time.sleep(RETRY_PERIOD)
 
